@@ -1,0 +1,85 @@
+#+TITLE: org-formatter
+#+AUTHOR: 
+#+LANGUAGE: en
+
+* Introduction
+=org-formatter= is a fast, specialized CLI tool written in Rust designed to format Emacs Org-mode files. It reads Org-mode content from standard input (=stdin=), formats it according to customizable rules, and outputs the result to standard output (=stdout=). 
+
+* Features
+- *Heading Spacing*: Configurable blank lines between a heading and its content, and between consecutive headings.
+- *Paragraph Wrapping*: Optional paragraph wrapping with a customizable fill column.
+- *List Formatting*: Normalizes indentation and spacing for unordered and ordered lists.
+- *Block & Drawer Preservation*: Safely preserves Org blocks (e.g., =#+BEGIN_SRC= / =#+END_SRC=) and property drawers (e.g., =:PROPERTIES:= / =:END:=) while formatting content around them.
+- *Check Mode*: Quickly verify if a file is formatted without modifying it, ideal for CI pipelines.
+
+* Installation
+
+Ensure you have Rust installed. Clone this repository and build the project using Cargo:
+
+#+BEGIN_SRC sh
+git clone <repository_url>
+cd org-formatter
+cargo build --release
+#+END_SRC
+
+The compiled executable will be located at =target/release/org-formatter=.
+
+* Usage
+You can run the formatter via command line by piping content into it:
+
+#+BEGIN_SRC sh
+cat my_file.org | ./target/release/org-formatter [OPTIONS] > formatted_file.org
+#+END_SRC
+
+** Options
+- =--heading-to-body-spacing=N= : Set the number of blank lines between an Org heading and the body text (default: 1).
+- =--heading-to-heading-spacing=N= : Set the number of blank lines between consecutive Org headings (default: 1).
+- =--wrap-paragraphs= : Enable automatic wrapping of regular text paragraphs.
+- =--fill-column=N= : Set the maximum line width for wrapping paragraphs (default: 80).
+- =--check= : Check if the input is already correctly formatted. Exits with status =0= if formatted, =1= otherwise.
+
+* Emacs Integration
+You can seamlessly integrate =org-formatter= into Emacs to format your Org files on save using the [[https://github.com/lassik/emacs-format-all-the-code][format-all]] package.
+
+Below is an example configuration (similar to the setup found in =~/.emacs.d/init.org=) to define and register the custom formatter:
+
+#+BEGIN_SRC elisp
+(use-package format-all
+  :config
+  ;; Customization variables for org-formatter
+  (defcustom format-all-org-formatter-heading-to-body-spacing 1
+    "Spacing between org heading and body."
+    :type 'integer)
+
+  (defcustom format-all-org-formatter-heading-to-heading-spacing 1
+    "Spacing between org headings."
+    :type 'integer)
+
+  (defcustom format-all-org-formatter-wrap-paragraphs t
+    "Whether to wrap paragraphs in org-formatter."
+    :type 'boolean)
+
+  (defcustom format-all-org-formatter-fill-column 80
+    "Fill column for org-formatter."
+    :type 'integer)
+
+  ;; Define custom org-formatter with dynamically built CLI arguments list
+  (define-format-all-formatter org-formatter
+    ;; Update this path to where you compiled the org-formatter binary
+    (:executable "~/update/path/to/where/to/compiled/org-formatter/binary")
+    (:install)
+    (:format
+     (format-all--buffer-easy
+      executable
+      (append (list (format "--heading-to-body-spacing=%d"
+                            format-all-org-formatter-heading-to-body-spacing)
+                    (format "--heading-to-heading-spacing=%d"
+                            format-all-org-formatter-heading-to-heading-spacing))
+              (when format-all-org-formatter-wrap-paragraphs
+                (list "--wrap-paragraphs"
+                      (format "--fill-column=%d"
+                              format-all-org-formatter-fill-column)))))))
+
+  ;; Register the custom formatter for Org mode
+  (add-to-list 'format-all-default-formatters '("Org" org-formatter)))
+#+END_SRC
