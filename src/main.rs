@@ -5,6 +5,7 @@ struct FormatOptions {
     heading_to_body_spacing: usize,    // 0 or 1, default is 1
     heading_to_heading_spacing: usize, // 0 or 1, default is 1
     wrap_paragraphs: bool,             // default is false
+    wrap_lists: bool,                  // default is false
     fill_column: usize,                // default is 80
 }
 
@@ -14,6 +15,7 @@ impl Default for FormatOptions {
             heading_to_body_spacing: 1,
             heading_to_heading_spacing: 1,
             wrap_paragraphs: false,
+            wrap_lists: false,
             fill_column: 80,
         }
     }
@@ -65,6 +67,10 @@ fn get_heading_level(line: &str) -> Option<usize> {
     } else {
         None
     }
+}
+
+fn is_heading_or_drawer_end(line: &str) -> bool {
+    is_heading_line(line) || line.trim().ends_with(":END:")
 }
 
 fn is_list_item(line: &str) -> bool {
@@ -227,6 +233,167 @@ fn is_regular_paragraph_line(line: &str) -> bool {
     true
 }
 
+fn char_width(c: char) -> usize {
+    if c == '\t' {
+        8
+    } else {
+        let val = c as u32;
+        if (val >= 0x1100 && val <= 0x11FF) || // Hangul Jamo
+           (val >= 0x2E80 && val <= 0x2EFF) || // CJK Radicals Supplement
+           (val >= 0x3000 && val <= 0x303F) || // CJK Symbols and Punctuation
+           (val >= 0x3040 && val <= 0x309F) || // Hiragana
+           (val >= 0x30A0 && val <= 0x30FF) || // Katakana
+           (val >= 0x3130 && val <= 0x318F) || // Hangul Compatibility Jamo
+           (val >= 0x3200 && val <= 0x32FF) || // Enclosed CJK Letters and Months
+           (val >= 0x3400 && val <= 0x4DBF) || // CJK Unified Ideographs Extension A
+           (val >= 0x4E00 && val <= 0x9FFF) || // CJK Unified Ideographs
+           (val >= 0xF900 && val <= 0xFAFF) || // CJK Compatibility Ideographs
+           (val >= 0xFF00 && val <= 0xFFEF) || // Halfwidth and Fullwidth Forms
+           (val >= 0xAC00 && val <= 0xD7AF) || // Hangul Syllables
+           (val >= 0x20000 && val <= 0x3FFFD)   // Plane 2 & 3 CJK Ideographs
+        {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+fn split_list_line(line: &str) -> Option<(String, String, String)> {
+    let indent = line
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect::<String>();
+    let trimmed = line.trim_start();
+    
+    if !is_list_item(trimmed) {
+        return None;
+    }
+
+    if trimmed.starts_with('-') || trimmed.starts_with('+') || trimmed.starts_with('*') {
+        let bullet_char = trimmed.chars().next().unwrap();
+        let after_bullet = &trimmed[1..];
+        let spaces = after_bullet
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect::<String>();
+        let bullet_part = if spaces.is_empty() {
+            format!("{}", bullet_char)
+        } else {
+            format!("{}{}", bullet_char, spaces)
+        };
+        let content = after_bullet[spaces.len()..].trim().to_string();
+        return Some((indent, bullet_part, content));
+    }
+
+    if let Some(first_char) = trimmed.chars().next() {
+        if first_char.is_ascii_digit() {
+            let digits_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+            let after_digits = &trimmed[digits_count..];
+            if after_digits.starts_with('.') || after_digits.starts_with(')') {
+                let bullet_marker = &trimmed[..digits_count + 1];
+                let after_marker = &trimmed[digits_count + 1..];
+                let spaces = after_marker
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                let bullet_part = format!("{}{}", bullet_marker, spaces);
+                let content = after_marker[spaces.len()..].trim().to_string();
+                return Some((indent, bullet_part, content));
+            }
+        } else if first_char.is_ascii_lowercase() {
+            let after_char = &trimmed[1..];
+            if after_char.starts_with('.') || after_char.starts_with(')') {
+                let bullet_marker = &trimmed[..2];
+                let after_marker = &trimmed[2..];
+                let spaces = after_marker
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<String>();
+                let bullet_part = format!("{}{}", bullet_marker, spaces);
+                let content = after_marker[spaces.len()..].trim().to_string();
+                return Some((indent, bullet_part, content));
+            }
+        }
+    }
+
+    None
+}
+
+fn wrap_list_line(line: &str, fill_column: usize) -> Vec<String> {
+    if let Some((indent, bullet, content)) = split_list_line(line) {
+        if content.is_empty() {
+            return vec![format_list_line(line)];
+        }
+
+        let words: Vec<&str> = content.split_whitespace().collect();
+        if words.is_empty() {
+            return vec![format_list_line(line)];
+        }
+
+        let indent_width = str_width(&indent);
+        let bullet_width = str_width(&bullet);
+        let first_line_prefix_width = indent_width + bullet_width;
+
+        let subsequent_indent = format!("{}{}", indent, " ".repeat(bullet_width));
+        let subsequent_indent_width = indent_width + bullet_width;
+
+        let mut wrapped_lines = Vec::new();
+        let mut current_line = String::new();
+
+        let first_target_width = if fill_column > first_line_prefix_width {
+            fill_column - first_line_prefix_width
+        } else {
+            1
+        };
+
+        let subsequent_target_width = if fill_column > subsequent_indent_width {
+            fill_column - subsequent_indent_width
+        } else {
+            1
+        };
+
+        let mut is_first_line = true;
+
+        for word in words {
+            let word_width = str_width(word);
+            let current_width = str_width(&current_line);
+            let target_width = if is_first_line { first_target_width } else { subsequent_target_width };
+
+            if current_line.is_empty() {
+                current_line.push_str(word);
+            } else if current_width + 1 + word_width <= target_width {
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                if is_first_line {
+                    wrapped_lines.push(format!("{}{}{}", indent, bullet, current_line));
+                    is_first_line = false;
+                } else {
+                    wrapped_lines.push(format!("{}{}", subsequent_indent, current_line));
+                }
+                current_line = word.to_string();
+            }
+        }
+
+        if !current_line.is_empty() {
+            if is_first_line {
+                wrapped_lines.push(format!("{}{}{}", indent, bullet, current_line));
+            } else {
+                wrapped_lines.push(format!("{}{}", subsequent_indent, current_line));
+            }
+        }
+
+        wrapped_lines
+    } else {
+        vec![line.to_string()]
+    }
+}
+
 fn wrap_paragraph(paragraph: &[String], fill_column: usize) -> Vec<String> {
     if paragraph.is_empty() {
         return Vec::new();
@@ -261,17 +428,20 @@ fn wrap_paragraph(paragraph: &[String], fill_column: usize) -> Vec<String> {
     let mut wrapped_lines = Vec::new();
     let mut current_line = String::new();
 
+    let indent_width = str_width(&indent);
     // Ensure target column accounts for indentation
-    let target_width = if fill_column > indent_len {
-        fill_column - indent_len
+    let target_width = if fill_column > indent_width {
+        fill_column - indent_width
     } else {
         1 // Fallback in case indentation is larger than fill_column
     };
 
     for word in words {
+        let word_width = str_width(word);
+        let current_width = str_width(&current_line);
         if current_line.is_empty() {
             current_line.push_str(word);
-        } else if current_line.len() + 1 + word.len() <= target_width {
+        } else if current_width + 1 + word_width <= target_width {
             current_line.push(' ');
             current_line.push_str(word);
         } else {
@@ -304,7 +474,7 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
 
     let mut formatted_lines = Vec::new();
     let mut state = State::Normal;
-    let mut pending_empty_line = false;
+    let mut pending_empty_lines = 0;
     let mut is_first_line = true;
 
     // Consecutive paragraph lines accumulator
@@ -312,16 +482,18 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
 
     let flush_paragraph = |accumulated: &mut Vec<String>,
                            formatted: &mut Vec<String>,
-                           pending: &mut bool,
+                           pending_lines: &mut usize,
                            is_first: &mut bool| {
         if accumulated.is_empty() {
             return;
         }
 
-        if *pending && !*is_first {
-            formatted.push(String::new());
-            *pending = false;
+        if !*is_first {
+            for _ in 0..*pending_lines {
+                formatted.push(String::new());
+            }
         }
+        *pending_lines = 0;
 
         let wrapped = wrap_paragraph(accumulated, options.fill_column);
         for line in wrapped {
@@ -346,7 +518,7 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                         .collect::<String>();
                     formatted_lines.push(format!("{}{}", indent, closing_tag));
                     state = State::Normal;
-                    pending_empty_line = true;
+                    pending_empty_lines = 1;
                 } else {
                     formatted_lines.push(trimmed.to_string());
                 }
@@ -356,7 +528,7 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                 if trimmed_upper == ":END:" {
                     formatted_lines.push(format!("{}{}", indent, ":END:"));
                     state = State::Normal;
-                    pending_empty_line = true;
+                    pending_empty_lines = options.heading_to_body_spacing;
                 } else if is_empty {
                     // Collapse empty lines inside drawers
                 } else {
@@ -384,10 +556,10 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                     flush_paragraph(
                         &mut accumulated_paragraph,
                         &mut formatted_lines,
-                        &mut pending_empty_line,
+                        &mut pending_empty_lines,
                         &mut is_first_line,
                     );
-                    pending_empty_line = true;
+                    pending_empty_lines = 1;
                     continue;
                 }
 
@@ -397,22 +569,24 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                     flush_paragraph(
                         &mut accumulated_paragraph,
                         &mut formatted_lines,
-                        &mut pending_empty_line,
+                        &mut pending_empty_lines,
                         &mut is_first_line,
                     );
 
-                    let last_was_heading = formatted_lines
+                    let last_is_header = formatted_lines
                         .last()
-                        .map(|l| is_heading_line(l))
+                        .map(|l| is_heading_or_drawer_end(l))
                         .unwrap_or(false);
-                    if last_was_heading {
-                        pending_empty_line = options.heading_to_body_spacing > 0;
+                    if last_is_header {
+                        pending_empty_lines = options.heading_to_body_spacing;
                     }
 
-                    if pending_empty_line && !is_first_line {
-                        formatted_lines.push(String::new());
-                        pending_empty_line = false;
+                    if !is_first_line {
+                        for _ in 0..pending_empty_lines {
+                            formatted_lines.push(String::new());
+                        }
                     }
+                    pending_empty_lines = 0;
 
                     let first_word_upper = trimmed_upper.split_whitespace().next().unwrap_or("");
                     let keyword = first_word_upper.strip_prefix("#+BEGIN_").unwrap_or("");
@@ -468,13 +642,13 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                     flush_paragraph(
                         &mut accumulated_paragraph,
                         &mut formatted_lines,
-                        &mut pending_empty_line,
+                        &mut pending_empty_lines,
                         &mut is_first_line,
                     );
 
-                    let last_was_heading = formatted_lines
+                    let last_is_header = formatted_lines
                         .last()
-                        .map(|l| is_heading_line(l))
+                        .map(|l| is_heading_or_drawer_end(l))
                         .unwrap_or(false);
 
                     let mut indent = raw_line
@@ -482,8 +656,8 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                         .take_while(|c| c.is_whitespace())
                         .collect::<String>();
 
-                    if last_was_heading {
-                        pending_empty_line = false;
+                    if last_is_header {
+                        pending_empty_lines = 0;
                         if !indent.is_empty() {
                             if let Some(last_line) = formatted_lines.last() {
                                 if let Some(level) = get_heading_level(last_line) {
@@ -491,9 +665,11 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                                 }
                             }
                         }
-                    } else if pending_empty_line && !is_first_line {
-                        formatted_lines.push(String::new());
-                        pending_empty_line = false;
+                    } else if !is_first_line {
+                        for _ in 0..pending_empty_lines {
+                            formatted_lines.push(String::new());
+                        }
+                        pending_empty_lines = 0;
                     }
 
                     formatted_lines.push(format!("{}{}", indent, trimmed_upper));
@@ -503,72 +679,93 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
                     flush_paragraph(
                         &mut accumulated_paragraph,
                         &mut formatted_lines,
-                        &mut pending_empty_line,
+                        &mut pending_empty_lines,
                         &mut is_first_line,
                     );
 
-                    let last_was_heading = formatted_lines
+                    let last_is_header = formatted_lines
                         .last()
-                        .map(|l| is_heading_line(l))
+                        .map(|l| is_heading_or_drawer_end(l))
                         .unwrap_or(false);
 
-                    let need_empty_line = if last_was_heading {
-                        options.heading_to_heading_spacing > 0
+                    let spacing = if last_is_header {
+                        options.heading_to_heading_spacing
                     } else {
-                        !is_first_line
+                        if is_first_line { 0 } else { 1 }
                     };
 
-                    if need_empty_line {
+                    for _ in 0..spacing {
                         formatted_lines.push(String::new());
                     }
-                    pending_empty_line = false;
+                    pending_empty_lines = 0;
                     formatted_lines.push(trimmed.trim_start().to_string());
                     is_first_line = false;
                 } else if is_list_item(trimmed) {
                     flush_paragraph(
                         &mut accumulated_paragraph,
                         &mut formatted_lines,
-                        &mut pending_empty_line,
+                        &mut pending_empty_lines,
                         &mut is_first_line,
                     );
 
-                    let last_was_heading = formatted_lines
+                    let last_is_header = formatted_lines
                         .last()
-                        .map(|l| is_heading_line(l))
+                        .map(|l| is_heading_or_drawer_end(l))
                         .unwrap_or(false);
-                    if last_was_heading {
-                        pending_empty_line = options.heading_to_body_spacing > 0;
+                    if last_is_header {
+                        pending_empty_lines = options.heading_to_body_spacing;
                     }
 
-                    if pending_empty_line && !is_first_line {
-                        formatted_lines.push(String::new());
-                        pending_empty_line = false;
+                    if !is_first_line {
+                        for _ in 0..pending_empty_lines {
+                            formatted_lines.push(String::new());
+                        }
                     }
-                    formatted_lines.push(format_list_line(trimmed));
+                    pending_empty_lines = 0;
+
+                    if options.wrap_lists {
+                        let wrapped = wrap_list_line(trimmed, options.fill_column);
+                        for line in wrapped {
+                            formatted_lines.push(line);
+                        }
+                    } else {
+                        formatted_lines.push(format_list_line(trimmed));
+                    }
                     is_first_line = false;
                 } else {
                     if options.wrap_paragraphs && is_regular_paragraph_line(raw_line) {
+                        if accumulated_paragraph.is_empty() {
+                            let last_is_header = formatted_lines
+                                .last()
+                                .map(|l| is_heading_or_drawer_end(l))
+                                .unwrap_or(false);
+                            if last_is_header {
+                                pending_empty_lines = options.heading_to_body_spacing;
+                            }
+                        }
                         accumulated_paragraph.push(trimmed.to_string());
                     } else {
                         flush_paragraph(
                             &mut accumulated_paragraph,
                             &mut formatted_lines,
-                            &mut pending_empty_line,
+                            &mut pending_empty_lines,
                             &mut is_first_line,
                         );
 
-                        let last_was_heading = formatted_lines
+                        let last_is_header = formatted_lines
                             .last()
-                            .map(|l| is_heading_line(l))
+                            .map(|l| is_heading_or_drawer_end(l))
                             .unwrap_or(false);
-                        if last_was_heading {
-                            pending_empty_line = options.heading_to_body_spacing > 0;
+                        if last_is_header {
+                            pending_empty_lines = options.heading_to_body_spacing;
                         }
 
-                        if pending_empty_line && !is_first_line {
-                            formatted_lines.push(String::new());
-                            pending_empty_line = false;
+                        if !is_first_line {
+                            for _ in 0..pending_empty_lines {
+                                formatted_lines.push(String::new());
+                            }
                         }
+                        pending_empty_lines = 0;
                         formatted_lines.push(trimmed.to_string());
                         is_first_line = false;
                     }
@@ -581,7 +778,7 @@ fn format_org(input: &str, options: &FormatOptions) -> String {
     flush_paragraph(
         &mut accumulated_paragraph,
         &mut formatted_lines,
-        &mut pending_empty_line,
+        &mut pending_empty_lines,
         &mut is_first_line,
     );
 
@@ -610,6 +807,9 @@ fn main() {
         }
         if arg == "--wrap-paragraphs" {
             options.wrap_paragraphs = true;
+        }
+        if arg == "--wrap-lists" {
+            options.wrap_lists = true;
         }
         if arg.starts_with("--fill-column=") {
             if let Some(val_str) = arg.split('=').nth(1) {
@@ -858,6 +1058,124 @@ width. It has multiple words.
         let expected = "  This is an indented paragraph that has multiple
   lines and should preserve the two spaces
   indentation.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_custom_heading_to_body_spacing_2() {
+        let input = "* Heading 1
+Some body text.
+** Heading 2
+Some other body text.";
+        let options = FormatOptions {
+            heading_to_body_spacing: 2,
+            ..FormatOptions::default()
+        };
+        let expected = "* Heading 1
+
+
+Some body text.
+
+** Heading 2
+
+
+Some other body text.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_custom_heading_to_body_spacing_with_drawer_and_wrap() {
+        let input = "* Heading 1
+  :PROPERTIES:
+  :CUSTOM_ID: abc
+  :END:
+This is some body text that will be wrapped because wrap paragraphs is enabled and it is quite long.
+* Heading 2
+This is some other body text under heading 2.";
+        let options = FormatOptions {
+            heading_to_body_spacing: 2,
+            wrap_paragraphs: true,
+            fill_column: 40,
+            ..FormatOptions::default()
+        };
+        let expected = "* Heading 1
+  :PROPERTIES:
+  :CUSTOM_ID: abc
+  :END:
+
+
+This is some body text that will be
+wrapped because wrap paragraphs is
+enabled and it is quite long.
+
+* Heading 2
+
+
+This is some other body text under
+heading 2.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_wrap_paragraphs_korean() {
+        let input = "오알지포매터는 이맥스의 기능을 러스트로 구현하여 빠르게 문서를 포맷팅할 수 있는 아주 유용한 도구입니다.";
+        let options = FormatOptions {
+            wrap_paragraphs: true,
+            fill_column: 40,
+            ..FormatOptions::default()
+        };
+        let expected = "오알지포매터는 이맥스의 기능을 러스트로
+구현하여 빠르게 문서를 포맷팅할 수 있는
+아주 유용한 도구입니다.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_wrap_lists() {
+        let input = "  - This is a very long list item line that should be nicely wrapped to multiple lines preserving the bullet indentation.";
+        let options = FormatOptions {
+            wrap_lists: true,
+            fill_column: 40,
+            ..FormatOptions::default()
+        };
+        let expected = "  - This is a very long list item line
+    that should be nicely wrapped to
+    multiple lines preserving the bullet
+    indentation.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_wrap_lists_korean() {
+        let input = "  * 매우 긴 한글 리스트 아이템입니다. 이것은 지정된 너비에 맞추어 여러 줄로 깔끔하게 래핑되어야 합니다.";
+        let options = FormatOptions {
+            wrap_lists: true,
+            fill_column: 40,
+            ..FormatOptions::default()
+        };
+        let expected = "  * 매우 긴 한글 리스트 아이템입니다.
+    이것은 지정된 너비에 맞추어 여러
+    줄로 깔끔하게 래핑되어야 합니다.
+";
+        assert_eq!(format_org(input, &options), expected);
+    }
+
+    #[test]
+    fn test_wrap_lists_ordered() {
+        let input = " 1. First ordered item that spans a considerable length to test the ordered list wrapping.";
+        let options = FormatOptions {
+            wrap_lists: true,
+            fill_column: 40,
+            ..FormatOptions::default()
+        };
+        let expected = " 1. First ordered item that spans a
+    considerable length to test the
+    ordered list wrapping.
 ";
         assert_eq!(format_org(input, &options), expected);
     }
